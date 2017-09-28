@@ -1,7 +1,11 @@
 package mapreduce
 
 import (
+	"encoding/json"
 	"hash/fnv"
+	"io/ioutil"
+	"log"
+	"os"
 )
 
 // doMap manages one map task: it reads one of the input files
@@ -53,6 +57,35 @@ func doMap(
 	//
 	// Remember to close the file after you have written all the values!
 	//
+	debug("DEBUG: Map jobName: %s, MapTaskNumber: %d, Map inFile: %s, nReduce: %d.\n", jobName, mapTaskNumber, inFile, nReduce)
+
+	fileContent, readError := ioutil.ReadFile(inFile)
+	if readError != nil {
+		log.Fatal("ERROR: can not read file. ", readError)
+	}
+	keyValues := mapF(inFile, string(fileContent))
+	intermediateFiles := map[string]*os.File{}
+	intermediateEncoders := map[string]*json.Encoder{}
+	for _, value := range keyValues {
+		intermediateFileName := reduceName(jobName, mapTaskNumber, (ihash(value.Key) % nReduce))
+		encoder, exists := intermediateEncoders[intermediateFileName]
+		if !exists {
+			file, fileCreateError := os.Create(intermediateFileName)
+			if fileCreateError != nil {
+				log.Fatal("ERROR: can not create file. ", fileCreateError)
+			}
+			encoder = json.NewEncoder(file)
+			intermediateEncoders[intermediateFileName] = encoder
+			intermediateFiles[intermediateFileName] = file
+		}
+		encodeError := encoder.Encode(&value)
+		if encodeError != nil {
+			log.Fatal("ERROR: can not encode. ", encodeError)
+		}
+	}
+	for _, file := range intermediateFiles {
+		file.Close()
+	}
 }
 
 func ihash(s string) int {

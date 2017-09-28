@@ -1,5 +1,12 @@
 package mapreduce
 
+import (
+	"encoding/json"
+	"log"
+	"os"
+	"sort"
+)
+
 // doReduce manages one reduce task: it reads the intermediate
 // key/value pairs (produced by the map phase) for this task, sorts the
 // intermediate key/value pairs by key, calls the user-defined reduce function
@@ -43,4 +50,51 @@ func doReduce(
 	// }
 	// file.Close()
 	//
+	debug("DEBUG: Reduce jobName: %s, ReduceTaskNumber: %d, outFile: %s, nMap: %d\n", jobName, reduceTaskNumber, outFile, nMap)
+
+	keyValues := map[string][]string{}
+	for i := 0; i < nMap; i++ {
+		intermediateFileName := reduceName(jobName, i, reduceTaskNumber)
+		if _, error := os.Stat(intermediateFileName); os.IsNotExist(error) {
+			debug("file %s not exist\n.", intermediateFileName)
+			continue
+		}
+		file, fileError := os.Open(intermediateFileName)
+		if fileError != nil {
+			log.Fatal("ERROR: can not open file. ", fileError)
+		}
+		decoder := json.NewDecoder(file)
+
+		var value KeyValue
+		for {
+			decodeError := decoder.Decode(&value)
+			if decodeError != nil {
+				break
+			}
+			if kv, exists := keyValues[value.Key]; exists {
+				keyValues[value.Key] = append(kv, value.Value)
+			} else {
+				keyValues[value.Key] = []string{value.Value}
+			}
+		}
+		file.Close()
+	}
+	var keys []string
+	for k, _ := range keyValues {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	mergeFileName := mergeName(jobName, reduceTaskNumber)
+	mergeFile, fileCreateError := os.Create(mergeFileName)
+	if fileCreateError != nil {
+		log.Fatal("ERROR: can not create file. ", fileCreateError)
+	}
+	defer mergeFile.Close()
+	encoder := json.NewEncoder(mergeFile)
+	for _, k := range keys {
+		encodeError := encoder.Encode(&KeyValue{k, reduceF(k, keyValues[k])})
+		if encodeError != nil {
+			log.Fatal("ERROR: can not encode. ", encodeError)
+		}
+	}
 }
