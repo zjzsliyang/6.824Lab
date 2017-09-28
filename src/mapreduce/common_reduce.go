@@ -50,7 +50,7 @@ func doReduce(
 	// }
 	// file.Close()
 	//
-	debug("DEBUG: Reduce jobName: %s, ReduceTaskNumber: %d, outFile: %s, nMap: %d", jobName, reduceTaskNumber, outFile, nMap)
+	debug("DEBUG: Reduce jobName: %s, ReduceTaskNumber: %d, outFile: %s, nMap: %d\n", jobName, reduceTaskNumber, outFile, nMap)
 
 	keyValues := map[string][]string{}
 	for i := 0; i < nMap; i++ {

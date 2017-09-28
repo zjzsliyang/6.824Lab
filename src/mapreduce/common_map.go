@@ -57,11 +57,11 @@ func doMap(
 	//
 	// Remember to close the file after you have written all the values!
 	//
-	debug("DEBUG: Map jobName: %s, MapTaskNumber: %d, Map inFile: %s, nReduce: %d", jobName, mapTaskNumber, inFile, nReduce)
+	debug("DEBUG: Map jobName: %s, MapTaskNumber: %d, Map inFile: %s, nReduce: %d.\n", jobName, mapTaskNumber, inFile, nReduce)
 
 	fileContent, readError := ioutil.ReadFile(inFile)
 	if readError != nil {
-		log.Fatal("ERROR: can not read file: %s.", inFile)
+		log.Fatal("ERROR: can not read file. ", readError)
 	}
 	keyValues := mapF(inFile, string(fileContent))
 	intermediateFiles := map[string]*os.File{}
