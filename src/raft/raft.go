@@ -51,6 +51,12 @@ type ApplyMsg struct {
 	Snapshot    []byte // ignore for lab2; only used in lab3
 }
 
+type LogEntry struct {
+	Term    int
+	Index   int
+	Command interface{}
+}
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -72,6 +78,12 @@ type Raft struct {
 	voteCh        chan struct{}
 	appendCh      chan struct{}
 	electionTimer *time.Timer
+
+	log         []LogEntry
+	commitIndex int
+	lastApplied int
+	nextIndex   []int
+	matchIndex  []int
 }
 
 // return currentTerm and whether this server
@@ -120,6 +132,9 @@ type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
 	Term        int32
 	CandidateID int
+
+	LastLogIndex int
+	LastLogTerm  int
 }
 
 //
@@ -135,11 +150,18 @@ type RequestVoteReply struct {
 type AppendEntriesArgs struct {
 	Term     int32
 	LeaderID int
+
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries      []LogEntry
+	LeaderCommit int
 }
 
 type AppendEntriesReply struct {
 	Term    int32
 	Success bool
+
+	NextTrail int
 }
 
 //
@@ -152,6 +174,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.Term < rf.currentTerm {
 		reply.VoteGranted = false
 		reply.Term = rf.currentTerm
+		return
 	} else if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.updateStateTo(STATE_FOLLOWER)
@@ -165,6 +188,16 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			reply.VoteGranted = false
 		}
 	}
+
+	thisLastLogTerm := rf.log[rf.getLastLogIndex()].Term
+	if thisLastLogTerm > args.LastLogTerm {
+		reply.VoteGranted = false
+	} else if thisLastLogTerm == args.LastLogTerm {
+		if rf.getLastLogIndex() > args.LastLogIndex {
+			reply.VoteGranted = false
+		}
+	}
+
 	if reply.VoteGranted == true {
 		go func() {
 			rf.voteCh <- struct{}{}
@@ -173,12 +206,20 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	inform := func() {
+		go func() {
+			rf.appendCh <- struct{}{}
+		}()
+	}
+
 	rf.mu.Lock()
+	defer inform()
 	defer rf.mu.Unlock()
 
 	if args.Term < rf.currentTerm {
 		reply.Success = false
 		reply.Term = rf.currentTerm
+		return
 	} else if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.updateStateTo(STATE_FOLLOWER)
@@ -186,9 +227,43 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	} else {
 		reply.Success = true
 	}
-	go func() {
-		rf.appendCh <- struct{}{}
-	}()
+
+	if args.PrevLogIndex > rf.getLastLogIndex() {
+		reply.Success = false
+		reply.NextTrail = rf.getLastLogIndex() + 1
+		return
+	}
+	if args.PrevLogTerm != rf.log[args.PrevLogIndex].Term {
+		reply.Success = false
+		badTerm := rf.log[args.PrevLogIndex].Term
+		i := args.PrevLogIndex
+		for ; rf.log[i].Term == badTerm; i-- {
+		}
+		reply.NextTrail = i + 1
+		return
+	}
+	conflictIdx := 1
+	if rf.getLastLogIndex() < args.PrevLogIndex+len(args.Entries) {
+		conflictIdx = args.PrevLogIndex + 1
+	} else {
+		for idx := 0; idx < len(args.Entries); idx++ {
+			if rf.log[idx+args.PrevLogIndex+1].Term != args.Entries[idx].Term {
+				conflictIdx = idx + args.PrevLogIndex + 1
+				break
+			}
+		}
+	}
+	if conflictIdx != -1 {
+		rf.log = append(rf.log[:args.PrevLogIndex+1], args.Entries...)
+	}
+
+	if args.LeaderCommit > rf.commitIndex {
+		if args.LeaderCommit < rf.getLastLogIndex() {
+			rf.commitIndex = rf.getLastLogIndex()
+		} else {
+			rf.commitIndex = args.LeaderCommit
+		}
+	}
 }
 
 //
@@ -247,7 +322,15 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// Your code here (2B).
 	index := -1
 	term := -1
-	isLeader := rf.state == STATE_LEADER
+	isLeader := true
+
+	term, isLeader = rf.GetState()
+	if isLeader == true {
+		rf.mu.Lock()
+		index = len(rf.log)
+		rf.log = append(rf.log, LogEntry{term, index, command})
+		rf.mu.Unlock()
+	}
 
 	return index, term, isLeader
 }
@@ -263,7 +346,12 @@ func (rf *Raft) Kill() {
 }
 
 func (rf *Raft) broadcastVoteReq() {
-	args := RequestVoteArgs{atomic.LoadInt32(&rf.currentTerm), rf.me}
+	var args RequestVoteArgs
+	args.Term = rf.currentTerm
+	args.CandidateID = rf.me
+	args.LastLogIndex = rf.getLastLogIndex()
+	args.LastLogTerm = rf.log[args.LastLogIndex].Term
+
 	for i := range rf.peers {
 		if i == rf.me {
 			continue
@@ -290,23 +378,56 @@ func (rf *Raft) broadcastVoteReq() {
 }
 
 func (rf *Raft) broadcastAppendEntries() {
-	args := AppendEntriesArgs{rf.currentTerm, rf.me}
-	for i := range rf.peers {
-		if i != rf.me {
-			go func(server int) {
-				var reply AppendEntriesReply
-				if rf.state == STATE_LEADER && rf.sendAppendEntries(server, &args, &reply) {
-					rf.mu.Lock()
-					defer rf.mu.Unlock()
-					if !reply.Success {
-						if reply.Term > rf.currentTerm {
-							rf.currentTerm = reply.Term
-							rf.updateStateTo(STATE_FOLLOWER)
-						}
-					}
-				}
-			}(i)
+	sendAppendEntriesTo := func(server int) bool {
+		var args AppendEntriesArgs
+		rf.mu.Lock()
+		args.Term = rf.currentTerm
+		args.LeaderID = rf.me
+		args.LeaderCommit = rf.commitIndex
+		args.PrevLogIndex = rf.nextIndex[server] - 1
+		args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
+		if rf.getLastLogIndex() >= rf.nextIndex[server] {
+			args.Entries = rf.log[rf.nextIndex[server]:]
 		}
+		rf.mu.Unlock()
+
+		var reply AppendEntriesReply
+
+		if rf.state == STATE_LEADER && rf.sendAppendEntries(server, &args, &reply) {
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+			if reply.Success == true {
+				rf.nextIndex[server] += len(args.Entries)
+				rf.matchIndex[server] = rf.nextIndex[server] - 1
+			} else {
+				if rf.state != STATE_LEADER {
+					return false
+				}
+				if reply.Term > rf.currentTerm {
+					rf.currentTerm = reply.Term
+					rf.updateStateTo(STATE_FOLLOWER)
+				} else {
+					rf.nextIndex[server] = reply.NextTrail
+					return true
+				}
+			}
+		}
+		return false
+	}
+
+	for i := range rf.peers {
+		if i == rf.me {
+			continue
+		}
+		//if i != rf.me {
+		go func(server int) {
+			for {
+				if sendAppendEntriesTo(server) == false {
+					break
+				}
+			}
+		}(i)
+		//}
 	}
 }
 
@@ -327,6 +448,10 @@ func (rf *Raft) updateStateTo(state int) {
 		rf.state = STATE_CANDIDATE
 		rf.startElection()
 	case STATE_LEADER:
+		for i := range rf.peers {
+			rf.nextIndex[i] = rf.getLastLogIndex() + 1
+			rf.matchIndex[i] = 0
+		}
 		rf.state = STATE_LEADER
 	default:
 		fmt.Printf("Warning: invalid state %d, do nothing.\n", state)
@@ -356,9 +481,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here (2A, 2B, 2C).
 	rf.state = STATE_FOLLOWER
 	rf.voteFor = -1
-	rf.applyCh = applyCh
 	rf.voteCh = make(chan struct{})
 	rf.appendCh = make(chan struct{})
+
+	rf.nextIndex = make([]int, len(rf.peers))
+	rf.matchIndex = make([]int, len(rf.peers))
+	rf.applyCh = applyCh
+	rf.log = make([]LogEntry, 1)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -399,7 +528,42 @@ func (rf *Raft) startLoop() {
 			rf.mu.Unlock()
 		case STATE_LEADER:
 			rf.broadcastAppendEntries()
+			rf.updateCommitIndex()
 			time.Sleep(HBINTERVAL * time.Millisecond)
+		}
+		go rf.applyLog()
+	}
+}
+
+func (rf *Raft) updateCommitIndex() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	for i := rf.getLastLogIndex(); i > rf.commitIndex; i-- {
+		matchedCount := 1
+		for i, matched := range rf.matchIndex {
+			if i == rf.me {
+				continue
+			}
+			if matched > rf.commitIndex {
+				matchedCount++
+			}
+		}
+		if matchedCount > len(rf.peers)/2 {
+			rf.commitIndex = i
+			break
+		}
+	}
+}
+
+func (rf *Raft) applyLog() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if rf.commitIndex > rf.lastApplied {
+		for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
+			var msg ApplyMsg
+			msg.Index = i
+			msg.Command = rf.log[i].Command
+			rf.applyCh <- msg
 		}
 	}
 }
@@ -415,4 +579,8 @@ func (rf *Raft) startElection() {
 func randElectionDuration() time.Duration {
 	r := rand.New(rand.NewSource(time.Now().UnixNano()))
 	return time.Millisecond * time.Duration(r.Int63n(MAX_ELECTION_INTERVAL-MIN_ELECTION_INTERVAL)+MIN_ELECTION_INTERVAL)
+}
+
+func (rf *Raft) getLastLogIndex() int {
+	return len(rf.log) - 1
 }
